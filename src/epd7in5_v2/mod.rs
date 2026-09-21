@@ -43,6 +43,21 @@ pub const DEFAULT_BACKGROUND_COLOR: Color = Color::White;
 const IS_BUSY_LOW: bool = true;
 const SINGLE_BYTE_WRITE: bool = false;
 
+/// Refresh waveform for UC8179 / GDEY075T7 panels.
+///
+/// Fast modes require a panel with the corresponding OTP waveforms (as in
+/// GxEPD2's GDEY075T7 driver). Older V2 panels may not support these modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefreshMode {
+    /// Full cleaning refresh using the internal temperature sensor.
+    #[default]
+    Full,
+    /// Fast full refresh using the OTP waveform selected at 90 degrees.
+    Fast,
+    /// Differential refresh using the OTP waveform selected at 110 degrees.
+    Partial,
+}
+
 /// Epd7in5 (V2) driver
 ///
 pub struct Epd7in5<SPI, BUSY, DC, RST, DELAY> {
@@ -50,6 +65,9 @@ pub struct Epd7in5<SPI, BUSY, DC, RST, DELAY> {
     interface: DisplayInterface<SPI, BUSY, DC, RST, DELAY, SINGLE_BYTE_WRITE>,
     /// Background Color
     color: Color,
+    refresh_mode: RefreshMode,
+    initial_refresh: bool,
+    ram_initialized: bool,
 }
 
 impl<SPI, BUSY, DC, RST, DELAY> InternalWiAdditions<SPI, BUSY, DC, RST, DELAY>
@@ -62,15 +80,15 @@ where
     DELAY: DelayNs,
 {
     fn init(&mut self, spi: &mut SPI, delay: &mut DELAY) -> Result<(), SPI::Error> {
+        self.initial_refresh = true;
+        self.ram_initialized = false;
         // Reset the device
         self.interface.reset(delay, 10_000, 2_000);
 
-        // V2 procedure as described here:
-        // https://github.com/waveshare/e-Paper/blob/master/RaspberryPi%26JetsonNano/python/lib/waveshare_epd/epd7in5bc_V2.py
-        // and as per specs:
-        // https://www.waveshare.com/w/upload/6/60/7.5inch_e-Paper_V2_Specification.pdf
+        // UC8179 settings from GxEPD2_750_GDEY075T7 (Jean-Marc Zingg),
+        // retaining the existing Waveshare reset and power-on timing.
 
-        self.cmd_with_data(spi, Command::PowerSetting, &[0x07, 0x07, 0x3f, 0x3f])?;
+        self.cmd_with_data(spi, Command::PowerSetting, &[0x07, 0x07, 0x3f, 0x3f, 0x09])?;
         self.cmd_with_data(spi, Command::BoosterSoftStart, &[0x17, 0x17, 0x28, 0x17])?;
         self.command(spi, Command::PowerOn)?;
         delay.delay_ms(100);
@@ -78,8 +96,10 @@ where
         self.cmd_with_data(spi, Command::PanelSetting, &[0x1F])?;
         self.cmd_with_data(spi, Command::TconResolution, &[0x03, 0x20, 0x01, 0xE0])?;
         self.cmd_with_data(spi, Command::DualSpi, &[0x00])?;
-        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x10, 0x07])?;
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x29, 0x07])?;
         self.cmd_with_data(spi, Command::TconSetting, &[0x22])?;
+        self.cmd_with_data(spi, Command::PowerSaving, &[0x22])?;
+        self.configure_refresh(spi, RefreshMode::Full)?;
         Ok(())
     }
 }
@@ -105,7 +125,13 @@ where
         let interface = DisplayInterface::new(busy, dc, rst, delay_us);
         let color = DEFAULT_BACKGROUND_COLOR;
 
-        let mut epd = Epd7in5 { interface, color };
+        let mut epd = Epd7in5 {
+            interface,
+            color,
+            refresh_mode: RefreshMode::Full,
+            initial_refresh: true,
+            ram_initialized: false,
+        };
 
         epd.init(spi, delay)?;
 
@@ -119,7 +145,10 @@ where
     fn sleep(&mut self, spi: &mut SPI, delay: &mut DELAY) -> Result<(), SPI::Error> {
         self.wait_until_idle(spi, delay)?;
         self.command(spi, Command::PowerOff)?;
+        delay.delay_ms(1);
         self.wait_until_idle(spi, delay)?;
+        self.initial_refresh = true;
+        self.ram_initialized = false;
         self.cmd_with_data(spi, Command::DeepSleep, &[0xA5])?;
         Ok(())
     }
@@ -130,27 +159,61 @@ where
         buffer: &[u8],
         delay: &mut DELAY,
     ) -> Result<(), SPI::Error> {
+        assert_eq!(buffer.len(), buffer_len(WIDTH as usize, HEIGHT as usize));
         self.wait_until_idle(spi, delay)?;
-        self.cmd_with_data(spi, Command::DataStartTransmission2, buffer)?;
-        Ok(())
+        self.initialize_ram(spi)?;
+        self.command(spi, Command::PartialOut)?;
+        self.cmd_with_data(spi, Command::DataStartTransmission2, buffer)
     }
 
+    /// Write a tightly packed region; call `display_frame` to refresh it.
+    /// Select `RefreshMode::Partial` for a differential refresh.
+    ///
+    /// Panics if x/width are not multiples of eight, the nonempty rectangle is
+    /// outside the screen, or the buffer length is not exactly width * height / 8.
     fn update_partial_frame(
         &mut self,
-        _spi: &mut SPI,
-        _delay: &mut DELAY,
-        _buffer: &[u8],
-        _x: u32,
-        _y: u32,
-        _width: u32,
-        _height: u32,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        buffer: &[u8],
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
     ) -> Result<(), SPI::Error> {
-        unimplemented!();
+        assert!(width > 0 && height > 0);
+        assert!(x < WIDTH && y < HEIGHT);
+        assert!(width <= WIDTH - x && height <= HEIGHT - y);
+        assert!(x % 8 == 0 && width % 8 == 0);
+        assert_eq!(buffer.len(), (width / 8 * height) as usize);
+        self.wait_until_idle(spi, delay)?;
+        self.initialize_ram(spi)?;
+        self.command(spi, Command::PartialIn)?;
+        self.set_partial_window(spi, x, y, width, height)?;
+        self.cmd_with_data(spi, Command::DataStartTransmission2, buffer)?;
+        self.command(spi, Command::PartialOut)
     }
 
     fn display_frame(&mut self, spi: &mut SPI, delay: &mut DELAY) -> Result<(), SPI::Error> {
         self.wait_until_idle(spi, delay)?;
+        self.initialize_ram(spi)?;
+        // A reset loses the differential baseline, even if the visible image remains.
+        let mode = if self.initial_refresh {
+            RefreshMode::Full
+        } else {
+            self.refresh_mode
+        };
+        self.configure_refresh(spi, mode)?;
+        // Match GxEPD2's usePartialUpdateWindow=false: differential waveforms
+        // scan the whole panel. Unchanged pixels are preserved by old/new RAM.
+        // This also allows multiple partial writes before one refresh.
+        self.command(spi, Command::PartialOut)?;
+        self.set_partial_window(spi, 0, 0, WIDTH, HEIGHT)?;
         self.command(spi, Command::DisplayRefresh)?;
+        // Give BUSY time to assert before polling, as GxEPD2 does.
+        delay.delay_ms(1);
+        self.wait_until_idle(spi, delay)?;
+        self.initial_refresh = false;
         Ok(())
     }
 
@@ -161,22 +224,17 @@ where
         delay: &mut DELAY,
     ) -> Result<(), SPI::Error> {
         self.update_frame(spi, buffer, delay)?;
-        self.command(spi, Command::DisplayRefresh)?;
-        Ok(())
+        self.display_frame(spi, delay)
     }
 
     fn clear_frame(&mut self, spi: &mut SPI, delay: &mut DELAY) -> Result<(), SPI::Error> {
         self.wait_until_idle(spi, delay)?;
-        self.send_resolution(spi)?;
-
-        self.command(spi, Command::DataStartTransmission1)?;
-        self.interface.data_x_times(spi, 0x00, WIDTH / 8 * HEIGHT)?;
-
+        self.initialize_ram(spi)?;
+        self.command(spi, Command::PartialOut)?;
         self.command(spi, Command::DataStartTransmission2)?;
-        self.interface.data_x_times(spi, 0x00, WIDTH / 8 * HEIGHT)?;
-
-        self.command(spi, Command::DisplayRefresh)?;
-        Ok(())
+        self.interface
+            .data_x_times(spi, self.color.get_byte_value(), WIDTH / 8 * HEIGHT)?;
+        self.display_frame(spi, delay)
     }
 
     fn set_background_color(&mut self, color: Color) {
@@ -197,11 +255,15 @@ where
 
     fn set_lut(
         &mut self,
-        _spi: &mut SPI,
-        _delay: &mut DELAY,
-        _refresh_rate: Option<RefreshLut>,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        refresh_rate: Option<RefreshLut>,
     ) -> Result<(), SPI::Error> {
-        unimplemented!();
+        let mode = match refresh_rate.unwrap_or_default() {
+            RefreshLut::Full => RefreshMode::Full,
+            RefreshLut::Quick => RefreshMode::Partial,
+        };
+        self.set_refresh_mode(spi, delay, mode)
     }
 
     fn wait_until_idle(&mut self, spi: &mut SPI, delay: &mut DELAY) -> Result<(), SPI::Error> {
@@ -222,10 +284,6 @@ where
         self.interface.cmd(spi, command)
     }
 
-    fn send_data(&mut self, spi: &mut SPI, data: &[u8]) -> Result<(), SPI::Error> {
-        self.interface.data(spi, data)
-    }
-
     fn cmd_with_data(
         &mut self,
         spi: &mut SPI,
@@ -235,15 +293,83 @@ where
         self.interface.cmd_with_data(spi, command, data)
     }
 
-    fn send_resolution(&mut self, spi: &mut SPI) -> Result<(), SPI::Error> {
-        let w = self.width();
-        let h = self.height();
+    /// Select the waveform used by subsequent `display_frame` calls.
+    ///
+    /// The first refresh after construction or wake is always a normal full
+    /// refresh. Partial mode uses controller old/new RAM copying (N2OCP), so no
+    /// host-side old framebuffer or second write is needed. Keep panel power
+    /// and RAM intact between differential updates; periodically select Full
+    /// to remove ghosting. Fast modes follow GxEPD2's GDEY075T7 OTP sequences.
+    pub fn set_refresh_mode(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+        mode: RefreshMode,
+    ) -> Result<(), SPI::Error> {
+        self.wait_until_idle(spi, delay)?;
+        self.refresh_mode = mode;
+        Ok(())
+    }
 
-        self.command(spi, Command::TconResolution)?;
-        self.send_data(spi, &[(w >> 8) as u8])?;
-        self.send_data(spi, &[w as u8])?;
-        self.send_data(spi, &[(h >> 8) as u8])?;
-        self.send_data(spi, &[h as u8])
+    fn configure_refresh(&mut self, spi: &mut SPI, mode: RefreshMode) -> Result<(), SPI::Error> {
+        self.cmd_with_data(spi, Command::PanelSetting, &[0x1f])?;
+        // N2OCP copies the new image to previous RAM after each refresh.
+        self.cmd_with_data(spi, Command::VcomAndDataIntervalSetting, &[0x29, 0x07])?;
+        match mode {
+            RefreshMode::Full => {
+                self.cmd_with_data(spi, Command::CascadeSetting, &[0x00])?;
+                self.cmd_with_data(spi, Command::TemperatureCalibration, &[0x00])
+            }
+            RefreshMode::Fast | RefreshMode::Partial => {
+                self.cmd_with_data(spi, Command::CascadeSetting, &[0x02])?;
+                let temperature = if mode == RefreshMode::Fast {
+                    0x5a
+                } else {
+                    0x6e
+                };
+                self.cmd_with_data(spi, Command::ForceTemperature, &[temperature])
+            }
+        }
+    }
+
+    fn initialize_ram(&mut self, spi: &mut SPI) -> Result<(), SPI::Error> {
+        if !self.ram_initialized {
+            self.command(spi, Command::PartialOut)?;
+            self.command(spi, Command::DataStartTransmission1)?;
+            self.interface.data_x_times(spi, 0x00, WIDTH / 8 * HEIGHT)?;
+            self.command(spi, Command::DataStartTransmission2)?;
+            self.interface
+                .data_x_times(spi, self.color.get_byte_value(), WIDTH / 8 * HEIGHT)?;
+            self.ram_initialized = true;
+        }
+        Ok(())
+    }
+
+    fn set_partial_window(
+        &mut self,
+        spi: &mut SPI,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), SPI::Error> {
+        let xe = x + width - 1;
+        let ye = y + height - 1;
+        self.cmd_with_data(
+            spi,
+            Command::PartialWindow,
+            &[
+                (x >> 8) as u8,
+                x as u8,
+                (xe >> 8) as u8,
+                xe as u8,
+                (y >> 8) as u8,
+                y as u8,
+                (ye >> 8) as u8,
+                ye as u8,
+                0x01,
+            ],
+        )
     }
 }
 

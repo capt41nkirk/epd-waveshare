@@ -128,9 +128,18 @@ pub(crate) enum Command {
     ReadVcomValue = 0x81,
     /// This command sets `VCOM_DC` value.
     VcmDcSetting = 0x82,
-    // /// This is in all the Waveshare controllers for Epd7in5, but it's not documented
-    // /// anywhere in the datasheet `¯\_(ツ)_/¯`
-    // FlashMode = 0xE5,
+    /// Inclusive, byte-aligned partial RAM window.
+    PartialWindow = 0x90,
+    /// Enter partial RAM addressing.
+    PartialIn = 0x91,
+    /// Leave partial RAM addressing.
+    PartialOut = 0x92,
+    /// Select internal temperature or a forced OTP waveform temperature.
+    CascadeSetting = 0xE0,
+    /// VCOM/source power-saving timing.
+    PowerSaving = 0xE3,
+    /// Temperature used to select an OTP waveform when TSFIX is enabled.
+    ForceTemperature = 0xE5,
 }
 
 impl traits::Command for Command {

@@ -80,6 +80,57 @@ the backside of the panel.
 
 Use `epd7in5_v2` instead of `epd7in5`, because the protocol changed.
 
+For UC8179 / GDEY075T7 panels (including the TRMNL DIY 7.5-inch setup),
+`epd7in5_v2::RefreshMode` selects normal `Full`, fast full-screen `Fast`, or
+fast differential `Partial` refresh. The command sequences follow Jean-Marc
+Zingg's GxEPD2 `GxEPD2_750_GDEY075T7` driver, with forced OTP temperatures
+0x5A and 0x6E for fast full and partial updates respectively. Older V2 panel
+batches without these OTP waveforms are not covered by the fast modes.
+The experimental register-LUT fallback from GxEPD2 is not selected here.
+
+```rust,ignore
+use epd_waveshare::{epd7in5_v2::RefreshMode, prelude::*};
+
+// Establish the full-screen image after new() or wake_up().
+epd.update_and_display_frame(&mut spi, framebuffer, &mut delay)?;
+
+// Fast full refresh of a replacement framebuffer.
+epd.set_refresh_mode(&mut spi, &mut delay, RefreshMode::Fast)?;
+epd.update_and_display_frame(&mut spi, next_framebuffer, &mut delay)?;
+
+// Differential refresh of a tightly packed 80x32 region at (16, 40).
+// 1 = white, 0 = black, most significant bit is the leftmost pixel.
+epd.set_refresh_mode(&mut spi, &mut delay, RefreshMode::Partial)?;
+epd.update_partial_frame(&mut spi, &mut delay, region, 16, 40, 80, 32)?;
+epd.display_frame(&mut spi, &mut delay)?;
+
+// Periodically perform a normal full refresh to remove ghosting.
+epd.set_refresh_mode(&mut spi, &mut delay, RefreshMode::Full)?;
+epd.display_frame(&mut spi, &mut delay)?;
+```
+
+Partial rectangles must be nonempty, within 800x480, with x and width divisible
+by eight. The buffer must contain exactly `width / 8 * height` bytes, with no
+full-screen stride; invalid arguments panic before I/O. Full buffers must be
+exactly 48,000 bytes. Several regions can be written before `display_frame`.
+Like GxEPD2's default configuration, differential refresh scans the whole panel
+without restricting the refresh window; unchanged pixels use identical old/new
+data. `set_lut(Some(RefreshLut::Quick))` also selects differential mode, while
+`Full` or `None` selects normal full refresh.
+
+The controller copies new RAM to old RAM after refresh, so callers do not need
+a second framebuffer or a second write. Refresh methods wait for BUSY to clear.
+The first refresh after construction or wake is always normal full, regardless
+of the selected mode. RAM is initialized to the configured background before
+the first write, so a first partial write has a defined surrounding image.
+`clear_frame` uses the configured background and selected refresh mode.
+Keep panel power/RAM intact between partial refreshes; after sleep or power loss,
+call `wake_up` and upload the complete desired image again. The selected mode
+survives `wake_up`, but its first refresh still establishes a full baseline.
+
+These additions have not yet been compiled or hardware-tested on the TRMNL kit.
+
+
 ### [2]: 4.2 Inch E-Ink Black/White - Partial Refresh
 
 Out of the Box the original driver from Waveshare only supports full updates.
