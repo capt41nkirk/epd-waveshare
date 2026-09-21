@@ -4,6 +4,9 @@
     <a href="https://docs.rs/epd-waveshare"><img src="https://docs.rs/epd-waveshare/badge.svg" alt="Docs.rs"></a>
 </p>
 
+# Fork-notes
+This is a fork of the original repo and contains implementation for fast, partial refresh of the 7.5 inch epaper V2 (new version). It was tested on an esp32s3 (TRMNL DIY KIT) using the example in the hardware test folder.
+
 # EPD Driver
 
 This library contains a driver for E-Paper Modules mostly from Waveshare (which are basically the same as the Dalian Good
@@ -55,7 +58,7 @@ epd4in2.sleep(&mut spi, &mut delay)
 | :---: | --- | :---: | :---: | :---: | :---: |
 | [7.5 Inch B/W/R V2/V3 (B)](https://www.waveshare.com/product/displays/e-paper/epaper-1/7.5inch-e-paper-b.htm) | Black, White, Red | ✕ | ✕ | ✔ | ✔ |
 | [7.5 Inch B/W HD (A)](https://www.waveshare.com/product/displays/e-paper/epaper-1/7.5inch-hd-e-paper-hat.htm) | Black, White | ✕ | ✕ | ✔ | ✔ |
-| [7.5 Inch B/W V2 (A)](https://www.waveshare.com/product/7.5inch-e-paper-hat.htm) [[1](#1-75-inch-bw-v2-a)] | Black, White | ✕ | ✕ | ✔ | ✔ |
+| [7.5 Inch B/W V2 (A)](https://www.waveshare.com/product/7.5inch-e-paper-hat.htm) [[1](#1-75-inch-bw-v2-a)] | Black, White | ✕ | ✔ (and full fast) | ✔ | ✔ (partial: ~900 ms, full fast: ~1600 ms) |
 | [7.5 Inch B/W (A)](https://www.waveshare.com/product/7.5inch-e-paper-hat.htm) | Black, White | ✕ | ✕ | ✔ | ✔ |
 | [7.3 Inch HAT (F)](https://www.waveshare.com/product/7.3inch-e-paper-hat-f.htm) | Black, White, Red, Green, Blue, Yellow, Orange | ✕ | ✕ | ✔ | ✔ |
 | [5.83 Inch B/W/R (b)](https://www.waveshare.com/5.83inch-e-Paper-B.htm) | Black, White, Red | ✕ | Not officially | ✔ | ✔ |
