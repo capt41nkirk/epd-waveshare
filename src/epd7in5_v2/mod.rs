@@ -197,12 +197,7 @@ where
     fn display_frame(&mut self, spi: &mut SPI, delay: &mut DELAY) -> Result<(), SPI::Error> {
         self.wait_until_idle(spi, delay)?;
         self.initialize_ram(spi)?;
-        // A reset loses the differential baseline, even if the visible image remains.
-        let mode = if self.initial_refresh {
-            RefreshMode::Full
-        } else {
-            self.refresh_mode
-        };
+        let mode = self.effective_refresh_mode();
         self.configure_refresh(spi, mode)?;
         // Match GxEPD2's usePartialUpdateWindow=false: differential waveforms
         // scan the whole panel. Unchanged pixels are preserved by old/new RAM.
@@ -284,6 +279,43 @@ where
         self.interface.cmd(spi, command)
     }
 
+    /// Resume after `power_off_retaining_ram`, without resetting the controller.
+    /// The caller must guarantee uninterrupted panel logic power, preserved RAM,
+    /// and an unchanged RESET pin since a successful refresh. Otherwise use `new`.
+    pub fn resume_retained(
+        spi: &mut SPI,
+        busy: BUSY,
+        dc: DC,
+        rst: RST,
+        delay: &mut DELAY,
+        delay_us: Option<u32>,
+    ) -> Result<Self, SPI::Error> {
+        let mut epd = Self {
+            interface: DisplayInterface::new(busy, dc, rst, delay_us),
+            color: DEFAULT_BACKGROUND_COLOR,
+            refresh_mode: RefreshMode::Full,
+            initial_refresh: false,
+            ram_initialized: true,
+        };
+        epd.command(spi, Command::PowerOn)?;
+        delay.delay_ms(100);
+        epd.wait_until_idle(spi, delay)?;
+        Ok(epd)
+    }
+
+    /// Disable panel driving voltages while preserving powered controller RAM.
+    /// Unlike `sleep`, this does not issue DeepSleep or invalidate the baseline.
+    pub fn power_off_retaining_ram(
+        &mut self,
+        spi: &mut SPI,
+        delay: &mut DELAY,
+    ) -> Result<(), SPI::Error> {
+        self.wait_until_idle(spi, delay)?;
+        self.command(spi, Command::PowerOff)?;
+        delay.delay_ms(100);
+        self.wait_until_idle(spi, delay)
+    }
+
     fn cmd_with_data(
         &mut self,
         spi: &mut SPI,
@@ -295,8 +327,10 @@ where
 
     /// Select the waveform used by subsequent `display_frame` calls.
     ///
-    /// The first refresh after construction or wake is always a normal full
-    /// refresh. Partial mode uses controller old/new RAM copying (N2OCP), so no
+    /// Fast is a full-screen waveform and is valid for the first full-frame
+    /// update too (GxEPD2's useFastFullUpdate). Only differential Partial needs
+    /// an established baseline and falls back to Full after construction/reset.
+    /// Partial mode uses controller old/new RAM copying (N2OCP), so no
     /// host-side old framebuffer or second write is needed. Keep panel power
     /// and RAM intact between differential updates; periodically select Full
     /// to remove ghosting. Fast modes follow GxEPD2's GDEY075T7 OTP sequences.
@@ -309,6 +343,15 @@ where
         self.wait_until_idle(spi, delay)?;
         self.refresh_mode = mode;
         Ok(())
+    }
+
+    /// Waveform the next `display_frame` will actually execute. Query before
+    /// refreshing, since a successful refresh establishes the partial baseline.
+    pub fn effective_refresh_mode(&self) -> RefreshMode {
+        match (self.initial_refresh, self.refresh_mode) {
+            (true, RefreshMode::Partial) => RefreshMode::Full,
+            (_, mode) => mode,
+        }
     }
 
     fn configure_refresh(&mut self, spi: &mut SPI, mode: RefreshMode) -> Result<(), SPI::Error> {
@@ -376,6 +419,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_resume_and_standby_never_reset_or_clear_ram() {
+        use embedded_hal_mock::eh1::{delay::NoopDelay, digital, spi};
+        let mut spi = spi::Mock::new(&[
+            spi::Transaction::transaction_start(),
+            spi::Transaction::write(0x04),
+            spi::Transaction::transaction_end(),
+            spi::Transaction::transaction_start(),
+            spi::Transaction::write(0x71),
+            spi::Transaction::transaction_end(),
+            spi::Transaction::transaction_start(),
+            spi::Transaction::write(0x71),
+            spi::Transaction::transaction_end(),
+            spi::Transaction::transaction_start(),
+            spi::Transaction::write(0x02),
+            spi::Transaction::transaction_end(),
+            spi::Transaction::transaction_start(),
+            spi::Transaction::write(0x71),
+            spi::Transaction::transaction_end(),
+        ]);
+        let mut busy = digital::Mock::new(&[
+            digital::Transaction::get(digital::State::High),
+            digital::Transaction::get(digital::State::High),
+            digital::Transaction::get(digital::State::High),
+        ]);
+        let mut dc = digital::Mock::new(&[
+            digital::Transaction::set(digital::State::Low),
+            digital::Transaction::set(digital::State::Low),
+            digital::Transaction::set(digital::State::Low),
+            digital::Transaction::set(digital::State::Low),
+            digital::Transaction::set(digital::State::Low),
+        ]);
+        let mut rst = digital::Mock::new(&[]);
+        let mut delay = NoopDelay::new();
+        let mut epd = Epd7in5::resume_retained(
+            &mut spi,
+            busy.clone(),
+            dc.clone(),
+            rst.clone(),
+            &mut delay,
+            Some(0),
+        )
+        .unwrap();
+        assert!(!epd.initial_refresh);
+        assert!(epd.ram_initialized);
+        epd.power_off_retaining_ram(&mut spi, &mut delay).unwrap();
+        assert!(!epd.initial_refresh);
+        assert!(epd.ram_initialized);
+        spi.done();
+        busy.done();
+        dc.done();
+        rst.done();
+    }
 
     #[test]
     fn epd_size() {
