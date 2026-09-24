@@ -481,3 +481,7 @@ mod tests {
         assert_eq!(DEFAULT_BACKGROUND_COLOR, Color::White);
     }
 }
+
+/// Async SPI and delay variant (requires Rust 1.75 or newer).
+#[cfg(feature = "async")]
+pub mod asynchronous;
